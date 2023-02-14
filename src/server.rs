@@ -1,11 +1,15 @@
 #![cfg_attr(not(unix), allow(unused_imports))]
+
 use clap::Parser;
 use log::{debug, error, warn};
+// use macaddr::MacAddr;
 use macaddr::MacAddr;
 use netavark_proxy::cache::{Clear, LeaseCache};
 use netavark_proxy::dhcp_service::DhcpService;
 use netavark_proxy::g_rpc::netavark_proxy_server::{NetavarkProxy, NetavarkProxyServer};
-use netavark_proxy::g_rpc::{Empty, Lease as NetavarkLease, NetworkConfig, OperationResponse};
+use netavark_proxy::g_rpc::{
+    Empty, Lease as NetavarkLease, Lease, NetworkConfig, OperationResponse,
+};
 use netavark_proxy::ip;
 use netavark_proxy::proxy_conf::{
     get_cache_fqname, get_proxy_sock_fqname, DEFAULT_INACTIVITY_TIMEOUT, DEFAULT_TIMEOUT,
@@ -22,12 +26,13 @@ use std::{env, fs};
 use tokio::net::UnixListener;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
-use tonic::{transport::Server, Code, Code::Internal, Request, Response, Status};
+use tonic::{transport::Server, Code::Internal, Request, Response, Status, Code};
 
 #[derive(Debug)]
 /// This is the tonic netavark proxy service that is required to impl the Netavark Proxy trait which
@@ -45,7 +50,7 @@ struct NetavarkProxyService<W: Write + Clear> {
     // cache is the lease hashmap
     cache: Arc<Mutex<LeaseCache<W>>>,
     // the timeout for the dora operation
-    dora_timeout: isize,
+    dora_timeout: u32,
     // channel send-side for resetting the inactivity timeout
     timeout_sender: Arc<Mutex<Sender<i32>>>,
 }
@@ -67,6 +72,7 @@ impl<W: Write + Clear> NetavarkProxyService<W> {
     }
 }
 
+
 // gRPC request and response methods
 #[tonic::async_trait]
 impl<W: Write + Clear + Send + 'static> NetavarkProxy for NetavarkProxyService<W> {
@@ -76,53 +82,46 @@ impl<W: Write + Clear + Send + 'static> NetavarkProxy for NetavarkProxyService<W
         request: Request<NetworkConfig>,
     ) -> Result<Response<NetavarkLease>, Status> {
         debug!("Request from client {:?}", request.remote_addr());
-        // notify server of activity
         self.reset_inactivity_timeout();
 
         let cache = self.cache.clone();
-        let timeout = self.dora_timeout;
-        //Spawn a new thread to avoid tokio runtime issues
-        std::thread::spawn(move || {
-            // Set up some common values
-            let network_config = &request.into_inner();
-            let container_network_interface = network_config.container_iface.clone();
-            let mac_addr = network_config.container_mac_addr.clone();
-            if mac_addr.is_empty() {
-                return Err(Status::new(
-                    Code::InvalidArgument,
-                    "No mac address provided",
-                ));
-            }
-            match MacAddr::from_str(&mac_addr) {
-                Ok(_) => {}
-                Err(_) => return Err(Status::new(Code::InvalidArgument, "Invalid mac address")),
-            }
-            // create a dhcp service to get a lease.
-            let lease = DhcpService::new(network_config, timeout)?.get_lease()?;
-            // Try and add the lease information to the cache
-            if let Err(e) = cache
-                .lock()
-                .expect("Could not unlock cache. A thread was poisoned")
-                .add_lease(&mac_addr, &lease)
-            {
-                return Err(Status::new(
-                    Internal,
-                    format!("Error caching the lease: {e}"),
-                ));
-            }
+        let timeout = self.dora_timeout.clone();
 
-            // Switch into the container namespace and
-            // perform tcp/ip setup
-            ip::setup(
-                &lease,
-                &container_network_interface,
-                &network_config.ns_path.to_string(),
-            )?;
-
-            Ok(Response::new(lease))
-        })
-        .join()
-        .expect("Error joining thread")
+        // setup client side streaming
+        let network_config = request.into_inner();
+        // _tx will be dropped when the request is dropped, this will trigger rx, which means the
+        // client disconnected
+        let (_tx, mut rx) = oneshot::channel::<()>();
+        let lease = tokio::task::spawn(async move {
+            // Check if the connection has been dropped before attempting to get a lease
+            if rx.try_recv() == Err(TryRecvError::Closed) {
+                log::debug!("Request dropped, aborting DORA");
+                return Err(Status::new(Code::Aborted, "client disconnected"));
+            }
+            let get_lease = process_setup(network_config, &timeout, cache);
+            // watch the client and the lease, which ever finishes first return
+            let get_lease: Lease = tokio::select! {
+                    _ = &mut rx => {
+                        // we never send to tx, so this completing means that the other end, tx, was dropped!
+                        log::debug!("Request dropped, aborting DORA");
+                        return Err(Status::new(Code::Aborted, "client disconnected"))
+                    }
+                    lease = get_lease => {
+                        Ok::<Lease, Status>(lease?)
+                    }
+                }?;
+            // check after lease was found that the client is still there
+            if rx.try_recv() == Err(TryRecvError::Closed) {
+                log::debug!("Request dropped, aborting DORA");
+                return Err(Status::new(Code::Aborted, "client disconnected"));
+            }
+            return Ok(get_lease);
+        }).await;
+        return match lease {
+            Ok(Ok(lease)) => Ok(Response::new(lease)),
+            Ok(Err(status)) => Err(status),
+            Err(e) => Err(Status::new(Code::Unknown, e.to_string()))
+        }
     }
 
     /// When a container is shut down this method should be called. It will clear the lease information
@@ -148,19 +147,19 @@ impl<W: Write + Clear + Send + 'static> NetavarkProxy for NetavarkProxyService<W
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             // Send the DHCP release message
-            DhcpService::new(&nc, timeout)?
+            DhcpService::new(&nc, &timeout)?
                 .release_lease(&lease)
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             Ok(Response::new(lease))
         })
-        .join()
-        .expect("Error joining thread")
+            .join()
+            .expect("Error joining thread")
     }
 
     /// On teardown of the proxy the cache will be cleared gracefully.
     async fn clean(&self, request: Request<Empty>) -> Result<Response<OperationResponse>, Status> {
-        log::debug!("Request from client: {:?}", request.remote_addr());
+        debug!("Request from client: {:?}", request.remote_addr());
         self.cache
             .clone()
             .lock()
@@ -171,7 +170,7 @@ impl<W: Write + Clear + Send + 'static> NetavarkProxy for NetavarkProxyService<W
 }
 
 #[derive(Parser, Debug)]
-#[clap(version = env!("CARGO_PKG_VERSION"))]
+#[clap(version = env ! ("CARGO_PKG_VERSION"))]
 struct Opts {
     /// location to store backup files
     #[clap(short, long)]
@@ -181,7 +180,7 @@ struct Opts {
     uds: Option<String>,
     /// optional time in seconds to time out after looking for a lease
     #[clap(short, long)]
-    timeout: Option<isize>,
+    timeout: Option<u32>,
     /// activity timeout
     #[clap(short, long)]
     activity_timout: Option<u64>,
@@ -297,7 +296,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         //  a timeout duration of 0 means NEVER
         _ = handle_wakeup(activity_timeout_rx, inactivity_timeout, cache.clone()), if inactivity_timeout.as_secs() > 0  => {},
         _ = &mut server => {},
-    };
+    }
+    ;
 
     fs::remove_file(uds_path);
     Ok(())
@@ -318,7 +318,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// ```
 async fn handle_wakeup<W: Write + Clear>(
-    mut rx: tokio::sync::mpsc::Receiver<i32>,
+    mut rx: mpsc::Receiver<i32>,
     timeout_duration: Duration,
     current_cache: Arc<Mutex<LeaseCache<W>>>,
 ) {
@@ -370,4 +370,52 @@ fn is_catch_empty<W: Write + Clear>(current_cache: Arc<Mutex<LeaseCache<W>>>) ->
             false
         }
     }
+}
+
+/// Process network config into a lease and setup the ip
+///
+/// # Arguments
+///
+/// * `network_config`: Network config
+/// * `timeout`: dora timeout
+/// * `cache`: lease cache
+///
+/// returns: Result<Lease, Status>
+async fn process_setup<W: Write + Clear>(
+    network_config: NetworkConfig,
+    timeout: &u32,
+    cache: Arc<Mutex<LeaseCache<W>>>,
+) -> Result<Lease, Status> {
+    let container_network_interface = network_config.container_iface.clone();
+    let ns_path = network_config.ns_path.clone();
+    // Check mac address and add it to nc
+    let mac_addr = network_config.container_mac_addr.clone();
+    if mac_addr.is_empty() {
+        return Err(Status::new(Code::InvalidArgument, "No mac address provided"));
+    }
+    if MacAddr::from_str(&mac_addr).is_err() {
+        return Err(Status::new(Code::InvalidArgument, "Invalid mac address"));
+    };
+    let nv_lease = DhcpService::new(&network_config, &timeout)?
+        .get_lease()
+        .await?;
+    debug!("found a lease for {:?}", mac_addr);
+
+    if let Err(e) = cache
+        .lock()
+        .expect("Could not unlock cache. A thread was poisoned")
+        .add_lease(&mac_addr, &nv_lease)
+    {
+        return Err(Status::new(
+            Internal,
+            format!("Error caching the lease: {e}"),
+        ));
+    }
+
+    ip::setup(
+        &nv_lease,
+        &container_network_interface,
+        &ns_path,
+    )?;
+    return Ok(nv_lease);
 }

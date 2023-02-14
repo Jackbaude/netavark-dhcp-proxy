@@ -10,6 +10,7 @@ pub mod proxy_conf;
 pub mod types;
 
 use crate::g_rpc::netavark_proxy_client::NetavarkProxyClient;
+
 use http::Uri;
 use log::debug;
 use std::fs::File;
@@ -20,6 +21,7 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 use tower::service_fn;
+
 
 #[allow(clippy::unwrap_used)]
 pub mod g_rpc {
@@ -216,6 +218,7 @@ impl NetworkConfig {
     /// ```
     ///
     /// ```
+
     pub async fn get_lease(self, p: &str) -> Result<Lease, Status> {
         let mut client = NetworkConfig::get_client(p.to_string()).await?;
         let lease = match client.setup(Request::new(self)).await {
@@ -249,6 +252,7 @@ impl NetworkConfig {
         Ok(lease)
     }
 }
+
 trait VectorConv {
     fn to_v4_addrs(&self) -> Result<Option<Vec<Ipv4Addr>>, AddrParseError>;
     fn to_v6_addrs(&self) -> Result<Option<Vec<Ipv6Addr>>, AddrParseError>;
